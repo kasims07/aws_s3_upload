@@ -10,7 +10,11 @@ import 'package:http/http.dart' as http;
 import 'package:path/path.dart' as path;
 import 'package:recase/recase.dart';
 
+import 'storage_enum.dart';
+
 class AwsS3Progress {
+  AwsS3Progress._();
+
   static final _dio = Dio(
     BaseOptions(
       connectTimeout: const Duration(seconds: 30),
@@ -19,7 +23,6 @@ class AwsS3Progress {
     ),
   );
 
-  /// Upload a file with progress tracking, returning the file's public URL on success.
   static Future<String?> uploadFile({
     required String accessKey,
     required String secretKey,
@@ -33,21 +36,28 @@ class AwsS3Progress {
     String contentType = 'binary/octet-stream',
     bool useSSL = true,
     Map<String, String>? metadata,
-    void Function(double progress)? onProgress,
+    required void Function(StorageTransferProgress) onProgress,
     CancelToken? cancelToken,
   }) async {
     var httpStr = useSSL ? 'https' : 'http';
     final endpoint = '$httpStr://$bucket.s3.$region.amazonaws.com';
+    final length = await file.length();
 
-    String uploadKey = key ?? (destDir.isNotEmpty ? '$destDir/${filename ?? path.basename(file.path)}' : filename ?? path.basename(file.path));
+    void emitProgress(StorageTransferState state, {int transferred = 0}) {
+      onProgress(StorageTransferProgress(
+        transferredBytes: transferred,
+        totalBytes: length,
+        state: state,
+      ));
+    }
+
+    // Initial state
+    emitProgress(StorageTransferState.inProgress);
 
     try {
-      final length = await file.length();
+      String uploadKey = key ?? (destDir.isNotEmpty ? '$destDir/${filename ?? path.basename(file.path)}' : filename ?? path.basename(file.path));
 
-      // Convert metadata to AWS-compliant params
       final metadataParams = _convertMetadataToParams(metadata);
-
-      // Generate pre-signed policy
       final policy = Policy.fromS3PresignedPost(
         uploadKey,
         bucket,
@@ -62,10 +72,7 @@ class AwsS3Progress {
       final signingKey = SigV4.calculateSigningKey(secretKey, policy.datetime, region, 's3');
       final signature = SigV4.calculateSignature(signingKey, policy.encode());
 
-      // Prepare form data
       final formData = FormData();
-
-      // Add file with upload progress
       formData.files.add(MapEntry(
         'file',
         await MultipartFile.fromFile(
@@ -75,7 +82,6 @@ class AwsS3Progress {
         ),
       ));
 
-      // Add required fields
       formData.fields.addAll([
         MapEntry('key', policy.key),
         MapEntry('acl', aclToString(acl)),
@@ -87,47 +93,51 @@ class AwsS3Progress {
         MapEntry('Content-Type', contentType),
       ]);
 
-      // Add metadata if provided
       if (metadata != null) {
         formData.fields.addAll(metadataParams.entries.map((e) => MapEntry(e.key, e.value)));
       }
 
-      // Make the upload request
+      // Setup cancel token listener
+      cancelToken?.whenCancel.then((_) {
+        emitProgress(StorageTransferState.canceled);
+      });
+
       final response = await _dio.post(
         endpoint,
         data: formData,
         cancelToken: cancelToken,
         onSendProgress: (count, total) {
-          if (onProgress != null && total != -1) {
-            final progress = count / total;
-            onProgress(progress);
+          if (total != -1) {
+            emitProgress(StorageTransferState.inProgress, transferred: count);
           }
         },
         options: Options(
-          headers: {
-            'Accept': '*/*',
-          },
+          headers: {'Accept': '*/*'},
           validateStatus: (status) => status == 204,
           followRedirects: false,
         ),
       );
 
       if (response.statusCode == 204) {
-        onProgress?.call(1.0);
+        emitProgress(StorageTransferState.success, transferred: length);
         return '$endpoint/$uploadKey';
       }
 
+      emitProgress(StorageTransferState.failure);
       throw DioException(
         requestOptions: response.requestOptions,
         error: 'Upload failed with status: ${response.statusCode}',
       );
     } on DioException catch (e) {
-      debugPrint('Dio error during upload: ${e.message}');
       if (e.type == DioExceptionType.cancel) {
-        debugPrint('Upload was cancelled');
+        emitProgress(StorageTransferState.canceled);
+      } else {
+        emitProgress(StorageTransferState.failure);
       }
+      debugPrint('Dio error during upload: ${e.message}');
       rethrow;
     } catch (e) {
+      emitProgress(StorageTransferState.failure);
       debugPrint('Failed to upload to AWS: $e');
       rethrow;
     }
